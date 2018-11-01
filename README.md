@@ -1,24 +1,24 @@
 # ibfAnalytics
 
-Environments list:
+ParameterList list:
 
-- LOGIN 
-- PASSWORD 
-- SERVER_URL
-- DOMAIN
-- APP-KEY
-- SPECIAL_BOX
+- user_name 
+- password 
+- domain
+- app_key
+- special_box
+- cluster_year
 
 
 Run test:
 ```python
-from association_rules import AssociationRules
+from ibfanalytics import AssociationRules
 ar = AssociationRules()
 ar.run_test()
 ```
 or 
 ```python
-from user_cluster import UserCluster
+from ibfanalytics import UserCluster
 user = UserCluster()
 user.run_test()
 ```

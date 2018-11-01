@@ -43,9 +43,4 @@ tmtagsHistory
 
 dist/*
 build/*
-ibfanalytics.egg-info/*
-dependencies/*
-dependencies.zip
-#!ibfanalytics/*.py
-#!ibfanalytics/analytics/*
-#ibfanalytics/idna_ssl.py
+src/libs/*
