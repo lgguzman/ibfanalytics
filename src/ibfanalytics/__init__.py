@@ -1,6 +1,9 @@
+from itertools import combinations
+
 from pyspark.ml.fpm import FPGrowth
-from pyspark.sql.functions import  col, size
+from pyspark.sql.functions import col, size
 from sbxpy import SbxCore
+from functools import reduce
 import asyncio
 import os
 from pyspark.sql import SparkSession
@@ -16,34 +19,64 @@ from pyspark.ml.feature import PCA as PCAml
 
 class AssociationRules:
 
-    async def df_sbx_cart_item(self, sbx, spark, min_transaction=6, attribute='search_name', customer=None):
-        query = sbx.with_model('cart_box_item').fetch_models(['inventory.masterlist', 'cart_box']) \
+    async def df_sbx_cart_item(self, sbx, spark, min_transaction=6, attribute='variety_name', customer=None, to_suggested=False):
+        query = sbx.with_model('cart_box_item').fetch_models(['variety', 'cart_box', 'product_group']) \
             .and_where_is_not_null('cart_box.purchase')
         if customer  is not None:
             query = query.and_where_in('cart_box.customer', customer)
 
-        total_data = await query.find_all_query()
+        if not to_suggested:
+            total_data = await query.find_all_query()
+        else:
+            query.set_page(0)
+            query.set_page_size(5)
+            temp = await query.find()
+            total_data = [temp]
         d = {}
         errors = []
         for data in total_data:
             for item in data['results']:
                 try:
-                    item['name'] = data['fetched_results']['add_masterlist'][
-                        data['fetched_results']['inventory'][item['inventory']]['masterlist']][attribute]
+                    # item['name'] = data['fetched_results']['add_masterlist'][
+                    #     data['fetched_results']['inventory'][item['inventory']]['masterlist']][attribute]
+                    variety = data['fetched_results']['variety'][item['variety']]['variety_name']
+                    product_group = data['fetched_results']['product_group'][item['product_group']]['common_name']
+                    item['name'] = product_group #+ ' ' + variety
                     if data['fetched_results']['cart_box'][item['cart_box']]['purchase'] not in d:
                         d[data['fetched_results']['cart_box'][item['cart_box']]['purchase']] = {}
                     d[data['fetched_results']['cart_box'][item['cart_box']]['purchase']][item['name']] = 1
                 except Exception as inst:
                     errors.append(inst)
-        varieties = [(key, [k for k, val in value.items()]) for key, value in d.items()]
-        varieties = list(filter(lambda t: len(t[1]) > min_transaction, varieties))
-        return spark.createDataFrame(varieties, ["id", "items"]).repartition(100)
+        print("Errors")
+        print(errors)
+        if not to_suggested:
+            varieties = [(key, [k for k, val in value.items()]) for key, value in d.items()]
+            varieties = list(filter(lambda t: len(t[1]) > min_transaction, varieties))
+            return spark.createDataFrame(varieties, ["id", "items"]).repartition(100)
+        else:
+            def merging_data(varieties, elements):
+                for element in elements:
+                    if element not in varieties:
+                        varieties.append(element)
+                return varieties
+
+            varieties = [[k for k, val in value.items()] for key, value in d.items()]
+            varieties = reduce(merging_data, varieties, [])
+            return await self.transform_possible_list(spark, varieties)
 
 
     async def get_model(self, df, min_support=0.1, min_confidence=0.6):
         fpGrowth = FPGrowth(itemsCol="items", minSupport=min_support, minConfidence=min_confidence)
         model = fpGrowth.fit(df)
         return model.freqItemsets.sort("freq", ascending=False), model.associationRules.sort("confidence", ascending=True), model
+
+
+    async def transform_possible_list(self, spark, items):
+        combins = sorted(combinations(items), key=lambda comb: len(comb), reverse=True)
+        possibles = [(str(i), combins[i])  for i in range(len(combins))]
+        return spark.createDataFrame(possibles, ["id", "items"]).repartition(100)
+
+
 
     async def run_suggested(self, model, df):
         return model.transform(df).withColumn("item_size", size(col("items"))) \
@@ -77,7 +110,7 @@ class AssociationRules:
 class UserCluster:
 
 
-    async def df_sbx_customer_purchase_behaivor(self, sbx, spark, date_int, limit =3):
+    async def df_sbx_customer_purchase_behaivor(self, sbx, spark, date_int, limit =3, variety_sw = False):
         data_complete = await  sbx.with_model('cart_box_item').fetch_models(['cart_box']) \
             .and_where_greater_than('cart_box.charge_date', date_int) \
             .and_where_is_not_null('cart_box.purchase').find_all_query()
@@ -92,9 +125,11 @@ class UserCluster:
                     customer = data['fetched_results']['cart_box'][item['cart_box']]['customer']
                     if customer not in d:
                         d[customer] = {}
-                    purchase = item['product_group'] + ' ' +item['variety']
+                    purchase = item['product_group'] + ((' ' + item['variety']) if variety_sw else '')
                     if purchase not in d[customer]:
                         d[customer][purchase] = 1
+                    # else:
+                    #     d[customer][purchase] =  d[customer][purchase] + 1
                     if purchase not in groups:
                         groups[purchase] = 1
                 except Exception as inst:
@@ -109,7 +144,7 @@ class UserCluster:
                 if key not in data:
                     row['products'].append(0)
                 else:
-                    row['products'].append(1)
+                    row['products'].append(data[key])
             return row
 
         customers = [ newRow(value, key, columns) for key, value in d.items()]
