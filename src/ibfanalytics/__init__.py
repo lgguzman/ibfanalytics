@@ -20,7 +20,8 @@ from pyspark.ml.feature import PCA as PCAml
 class AssociationRules:
 
     async def df_sbx_cart_item(self, sbx, spark, min_transaction=6, attribute='variety_name', customer=None, to_suggested=False):
-        query = sbx.with_model('cart_box_item').fetch_models(['variety', 'cart_box', 'product_group']) \
+       # query = sbx.with_model('cart_box_item').fetch_models(['variety', 'cart_box', 'product_group']) \
+        query = sbx.with_model('cart_box_item').fetch_models(['variety', 'cart_box']) \
             .and_where_is_not_null('cart_box.purchase')
         if customer  is not None:
             query = query.and_where_in('cart_box.customer', customer)
@@ -29,7 +30,7 @@ class AssociationRules:
             total_data = await query.find_all_query()
         else:
             query.set_page(0)
-            query.set_page_size(5)
+            query.set_page_size(3)
             temp = await query.find()
             total_data = [temp]
         d = {}
@@ -39,16 +40,18 @@ class AssociationRules:
                 try:
                     # item['name'] = data['fetched_results']['add_masterlist'][
                     #     data['fetched_results']['inventory'][item['inventory']]['masterlist']][attribute]
-                    variety = data['fetched_results']['variety'][item['variety']]['variety_name']
-                    product_group = data['fetched_results']['product_group'][item['product_group']]['common_name']
-                    item['name'] = product_group #+ ' ' + variety
+                    color = data['fetched_results']['variety'][item['variety']]['color']
+                    variety = color#data['fetched_results']['color'][color]['_KEY']
+                    product_group = item['product_group']#data['fetched_results']['product_group'][item['product_group']]['_KEY']
+                    item['name'] = product_group + ' ' + variety
                     if data['fetched_results']['cart_box'][item['cart_box']]['purchase'] not in d:
                         d[data['fetched_results']['cart_box'][item['cart_box']]['purchase']] = {}
                     d[data['fetched_results']['cart_box'][item['cart_box']]['purchase']][item['name']] = 1
                 except Exception as inst:
                     errors.append(inst)
-        print("Errors")
-        print(errors)
+        if len(errors) > 0:
+            print("Errors")
+            print(errors)
         if not to_suggested:
             varieties = [(key, [k for k, val in value.items()]) for key, value in d.items()]
             varieties = list(filter(lambda t: len(t[1]) > min_transaction, varieties))
@@ -64,6 +67,22 @@ class AssociationRules:
             varieties = reduce(merging_data, varieties, [])
             return await self.transform_possible_list(spark, varieties)
 
+    async def df_from_varieties(self, sbx, spark, varieties):
+        query = sbx.with_model('variety')\
+            .where_with_keys(varieties)
+        total_data = await query.find_all_query()
+        errors = []
+        varieties = []
+        for data in total_data:
+            for item in data['results']:
+                try:
+                    varieties = item["product_group"]+" "+item["color"]
+                except Exception as inst:
+                    errors.append(inst)
+        if len(errors) > 0:
+            print("Errors")
+            print(errors)
+        return await self.transform_possible_list(spark, varieties)
 
     async def get_model(self, df, min_support=0.1, min_confidence=0.6):
         fpGrowth = FPGrowth(itemsCol="items", minSupport=min_support, minConfidence=min_confidence)
@@ -72,9 +91,11 @@ class AssociationRules:
 
 
     async def transform_possible_list(self, spark, items):
-        combins = sorted(combinations(items), key=lambda comb: len(comb), reverse=True)
+        combins = list( map (list,reduce(lambda acc, x: acc + list(combinations(items, x)), range(1, len(items) + 1), [])))
+        combins = sorted(combins, key=lambda comb: len(comb), reverse=True)
         possibles = [(str(i), combins[i])  for i in range(len(combins))]
-        return spark.createDataFrame(possibles, ["id", "items"]).repartition(100)
+        df = spark.createDataFrame(possibles, ["id", "items"]).repartition(100)
+        return df
 
 
 
@@ -82,6 +103,40 @@ class AssociationRules:
         return model.transform(df).withColumn("item_size", size(col("items"))) \
             .withColumn("prediction_size", size(col("prediction"))) \
             .orderBy(["item_size", "prediction"], ascending=[1, 0])
+
+
+    async def get_replacement(self, sbx, varieties):
+        query = sbx.with_model('replacement')\
+            .and_where_in("variety",varieties).or_where_in("replace",varieties)
+        total_data = await query.find_all_query()
+        errors = []
+        replacement = []
+        for data in total_data:
+            for item in data['results']:
+                try:
+                    if item["variety"] not in varieties:
+                        replacement.append(item["variety"])
+                    if item["replace"] not in varieties:
+                        replacement.append(item["replace"])
+                except Exception as inst:
+                    errors.append(inst)
+        return [varieties, list(set(replacement))]
+
+    async def get_varieties_from_product_color(self, sbx, product_color):
+        product_group = list(map( lambda x: x.split(" ")[0], product_color))
+        query = sbx.with_model('variety')\
+            .and_where_in("product_group",product_group)
+        total_data = await query.find_all_query()
+        errors = []
+        varieties = []
+        for data in total_data:
+            for item in data['results']:
+                try:
+                    if item["product_group"] + ' ' + item["color"]  in product_color:
+                        varieties.append(item["_KEY"])
+                except Exception as inst:
+                    errors.append(inst)
+        return await self.get_replacement(sbx,list(set(varieties)))
 
 
     async def  test(self):
@@ -206,8 +261,8 @@ class UserCluster:
             kmeans = KMeans()
         return  kmeans.fit(df.select('features'))
 
-    async def bisecting_means(self,df):
-        return BisectingKMeans().fit(df.select('features'))
+    async def bisecting_means(self,df,k):
+        return BisectingKMeans(k=k).fit(df.select('features'))
 
     async def gaussian_mixture(self,df):
         return GaussianMixture().fit(df.select('features'))
